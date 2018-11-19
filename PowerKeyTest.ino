@@ -2,11 +2,22 @@
 // Jeff Cooke Nov 2018
 
 /*
- * Todos
+ * DONE
  * - While 'Charging' - adjust the PWM 1hz rate of the Charger red LED to indicate state of charge
+ *    cNNN - set charging level to NNN%
  * - While 'Park' - if the handbrake is not on, flash the Park button
- * - Only activate Cruise Adjust (white) the Up and Down buttons when in Drive/Reverse and MPH > 0
+ *    h1/0 handbrake on/off
+ * - Switch from daytime (bright) to nighttime(dim) brightness settings
+ *    d1/0 daytime/nighttime 
+ *    
+ * TODOs
+ * - Only activate Cruise Adjust (white) the Up and Down buttons when in Drive/Reverse and MPH > 0 
+ *    mNNN - set the current speed to NNN
  * - Monitor ande detect Cruise setting/clearing (up or down held down for 2 full secs
+ * - When the Battery is fully charged, set the charge LED to green
+ * 
+ * CHECKS
+ * - Why getting spurious key press signal (v) common on Serial Monitor enable?
 */
 
 #include <mcp2515.h>
@@ -19,6 +30,15 @@
 #define BIT_CLEAR(a,b) ((a) &= ~(1ULL<<(b)))
 #define BIT_FLIP(a,b) ((a) ^= (1ULL<<(b)))
 #define BIT_CHECK(a,b) (!!((a) & (1ULL<<(b))))        // '!!' to make sure this returns 0 or 1
+
+// Unit Setups
+#define NO_HANDBRAKE_FLASH_RATE 250     // ms on/off for no handbrake during Park or Charge
+#define CHARGING_MIN_FLASH 100          // ms minimum flash time per second
+#define ACTIVATED_DAYTIME_BRIGHTNESS 0x2F
+#define BACKLIGHT_DAYTIME_BRIGHTNESS 0x01
+#define ACTIVATED_NIGHTTIME_BRIGHTNESS 0x0F
+#define BACKLIGHT_NIGHTTIME_BRIGHTNESS 0x01
+#define BACKLIGHT_COLOR 0x07    // 01 Red, 02 Green, 03 Blue, 04 Yellow, 05 Cyan, 06 Violet, 07 White, 08 Amber, 09 YelGreen
 
 // Set up CS on chip
 MCP2515 mcp2515(10);
@@ -96,7 +116,7 @@ enum ButtonColor {
 // Define the Actions associated with a new state
 int ActionTable [BUTTON_ACTIONS][7] = {
 {Drive,Blue,Black,White,White,White,White},
-{Reverse,White,Black,White,Blue,White,White},
+{Reverse,White,Black,Black,Blue,White,Black},
 {Park,White,Black,Black,White,Blue,Black},
 {Charge,Black,Red,Black,Black,Blue,Black},
 {FinCharge,White,Red,Black,White,Blue,Black}
@@ -115,14 +135,13 @@ uint8_t Colors[8][3] =
 {1,1,1}   // 7 White
 };
 
-
-
 // Set up CAN frames
 struct can_frame COpreop;
 struct can_frame COstart;
 struct can_frame COreadkey;
 struct can_frame COledon;
-struct can_frame CObckon;
+struct can_frame CObrigt;
+struct can_frame CObcolr;
 
 // Set up frame for incoming
 struct can_frame canMsg;
@@ -136,7 +155,14 @@ PadEvent ButtonEvent [6] = {Dbutton,Cbutton,Upbutton,Rbutton,Pbutton,Dwbutton};
 enum PadState DrvState;       // Current driving mode
 enum FootBrake BrkState;      // Current foot brake status
 enum HandBrake HndState;      // Current handbrake status
-int SpeedMPH;             // Current road speed
+int chargePCT;            // Current charge percent (whole integers 0-100)
+int speedMPH;             // Current road speed
+long time_handbrake_flash;    // Timer setting when the Park button light was last toggled
+bool parkLEDon;              // Flag to indicate if the Park LED is on or off
+bool dayTimeLights;               // Flag to indicate if daytime or nighttime brightness settings
+bool chargeLEDon;           // Flag to indicate if the charging light is on or off
+long time_charger_flash_on;    // Timer since last On status for the charger light
+long time_charger_flash_off;    // Timer since last Off status for the charger light
 
 void setup() {
 
@@ -144,7 +170,14 @@ void setup() {
   DrvState = Park;
   BrkState = BrakeOn;
   HndState = HandOn;
-  SpeedMPH = 0;
+  chargePCT = 0;
+  speedMPH = 0;
+  time_handbrake_flash = 0;
+  time_charger_flash_on = 0;
+  time_charger_flash_off = 0;
+  dayTimeLights = true;
+  parkLEDon = false;
+  chargeLEDon = false;
 
   // Populate the pre-op frame
   COstart.can_id = 0x00;
@@ -195,18 +228,30 @@ void setup() {
   COledon.data[6] = 0x00;
   COledon.data[7] = 0x00;
 
-  // Backlight brightness
-  CObckon.can_id = 0x515;
-  CObckon.can_dlc = 8;
-  CObckon.data[0] = 0x01;
-  CObckon.data[1] = 0x00;
-  CObckon.data[2] = 0x00;
-  CObckon.data[3] = 0x00;
-  CObckon.data[4] = 0x00;
-  CObckon.data[5] = 0x00;
-  CObckon.data[6] = 0x00;
-  CObckon.data[7] = 0x00;
-  
+  // Lighting Settings
+  CObrigt.can_id = 0x00;
+  CObrigt.can_dlc = 8;
+  CObrigt.data[0] = 0x00;
+  CObrigt.data[1] = 0x00;
+  CObrigt.data[2] = 0x00;
+  CObrigt.data[3] = 0x00;
+  CObrigt.data[4] = 0x00;
+  CObrigt.data[5] = 0x00;
+  CObrigt.data[6] = 0x00;
+  CObrigt.data[7] = 0x00;
+
+  // Background color
+  CObcolr.can_id = 0x615;
+  CObcolr.can_dlc = 8;
+  CObcolr.data[0] = 0x2F;
+  CObcolr.data[1] = 0x03;
+  CObcolr.data[2] = 0x20;
+  CObcolr.data[3] = 0x03;
+  CObcolr.data[4] = BACKLIGHT_COLOR;
+  CObcolr.data[5] = 0x00;
+  CObcolr.data[6] = 0x00;
+  CObcolr.data[7] = 0x00;
+
   // init the serial port - for status/debug
   while (!Serial);
   Serial.begin(115200);
@@ -227,9 +272,18 @@ void setup() {
   mcp2515.sendMessage(&COstart); 
   delay(500);
 
-  // Set the backlight
-  mcp2515.sendMessage(&CObckon); 
-  delay(100);
+  // Set the background color
+  mcp2515.sendMessage(&CObcolr);
+  
+  // Set the keypad brightness
+  CObrigt.can_id = 0x515;
+  CObrigt.data[0] = BACKLIGHT_DAYTIME_BRIGHTNESS;
+  mcp2515.sendMessage(&CObrigt);
+  delay(1);
+  CObrigt.can_id = 0x415;
+  CObrigt.data[0] = ACTIVATED_DAYTIME_BRIGHTNESS;
+  mcp2515.sendMessage(&CObrigt);
+  delay(1);
 
   // Reset the keypad display
   setButtonLEDstate(DrvState);
@@ -252,6 +306,30 @@ void setButtonColor(uint8_t bnum, ButtonColor bcol)
    COledon.data[1] = setclearBit(COledon.data[1],bnum,Colors[bcol][1]);
    COledon.data[2] = setclearBit(COledon.data[2],bnum,Colors[bcol][2]);
    mcp2515.sendMessage(&COledon);
+
+   // Extra check to set Park light related flags & timers
+   if (bnum==4 and bcol!=Black)
+   {
+     parkLEDon = true;
+     time_handbrake_flash = millis();
+   }
+   if (bnum==4 and bcol==Black)
+   {
+     parkLEDon = false;
+     time_handbrake_flash = millis();
+   }
+
+   // Extra check to set Charge light related flags & timers
+   if (bnum==1 and bcol !=Black)
+   {
+     chargeLEDon = true;
+     time_charger_flash_on = millis();
+   }
+   if (bnum==1 and bcol==Black)
+   {
+     chargeLEDon = false;
+     time_charger_flash_off = millis();
+   }
 }
 
 void allButtonLEDoff()
@@ -284,7 +362,11 @@ void setButtonLEDstate(PadState state)
         Serial.print((ButtonColor)ActionTable[i][j+1]);
         Serial.print("]");
         #endif
+        
+        // Set the color of the button
         setButtonColor(j,(ButtonColor)ActionTable[i][j+1]);
+
+        // Delay to allow KeyPad to catch up
         delay(1);   // KeyPad seems to need time to process the CAN frames if they come quickly
       }
       #ifdef debug
@@ -298,6 +380,87 @@ void loop() {
   //mcp2515.sendMessage(&COreadkey);
   //Serial.println("readkey send");
   //delay(500);
+
+  // Test the Serial input for test commands
+  char inChar = ' ';
+  int inNum = -1;
+  if (Serial.available())
+  {
+    inChar = Serial.read(); // read the incoming byte:
+    delay(1);
+    if (Serial.available())
+    {
+      inNum = Serial.parseInt();
+
+      switch (inChar)
+      {
+        case 'h':     // 'h' Handbrake
+          if (inNum == 0)
+          {HndState = HandOff;Serial.println("Handbrake OFF");}
+          else
+          {HndState = HandOn;Serial.println("Handbrake ON");}
+          break;
+  
+        case 'c':     // 'c' Charge state
+          if (inNum < 0){inNum = 0;}
+          if (inNum > 100){inNum = 100;}
+          chargePCT = inNum;
+          Serial.print("Charge ");
+          Serial.print(chargePCT,DEC);
+          Serial.println("%");
+          break;
+
+        case 'm':     // 'm' Speed
+          if (inNum < 0){inNum = 0;}
+          if (inNum > 160){inNum = 160;}    // Whoa slow down there buddy!
+          speedMPH = inNum;
+          Serial.print("Speed ");
+          Serial.print(speedMPH,DEC);
+          Serial.println(" mph");
+          break;
+          
+        case 'd':     // 'd' Daytime
+          if (inNum == 0)
+          {
+              dayTimeLights = false;
+              Serial.println("Nighttime");
+          }
+          else
+          {
+              dayTimeLights = true;
+              Serial.println("Daytime");
+          }
+          // Set the appropriate brightnesses for the keys and background lights
+          if (dayTimeLights)
+          {
+            CObrigt.can_id = 0x515;
+            CObrigt.data[0] = BACKLIGHT_DAYTIME_BRIGHTNESS;
+            mcp2515.sendMessage(&CObrigt);
+            delay(1);
+            CObrigt.can_id = 0x415;
+            CObrigt.data[0] = ACTIVATED_DAYTIME_BRIGHTNESS;
+            mcp2515.sendMessage(&CObrigt);
+            delay(1);
+          }
+          else
+          {
+            CObrigt.can_id = 0x515;
+            CObrigt.data[0] = BACKLIGHT_NIGHTTIME_BRIGHTNESS;
+            mcp2515.sendMessage(&CObrigt);
+            delay(1);
+            CObrigt.can_id = 0x415;
+            CObrigt.data[0] = ACTIVATED_NIGHTTIME_BRIGHTNESS;
+            mcp2515.sendMessage(&CObrigt);
+            delay(1);
+          }
+          break;
+          
+        default:
+          // default is optional
+          break;
+      }
+    }
+  }  // end of Serial input check
 
   // Receive check
   if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK) {
@@ -346,7 +509,7 @@ void loop() {
               Serial.println(ButtonEvent[b]);              
               #endif
 
-              // Switch off all the lights
+              // Update all the lights
               setButtonLEDstate(DrvState);
 
               // be sure to exit the loop
@@ -363,10 +526,68 @@ void loop() {
       }
       ButtonStates[b] = butntest;
     }
-  }
-  else
+  }     // End of CAN receive checks
+
+  // Check HandBrake
+  if ((DrvState == Park || DrvState == Charge || DrvState == FinCharge) && HndState == HandOff)
   {
-  //  Serial.println(" : no msg");
+    // Check delay and toggle as necessary
+    if (time_handbrake_flash < (millis() - NO_HANDBRAKE_FLASH_RATE))
+    {
+      if (parkLEDon)
+      {setButtonColor(4,Black);}
+      else
+      {setButtonColor(4,Blue);}
+    }
   }
+  // If the Handbrake restores while the Park LED is off (due to flashing) turn it back on
+  if ((DrvState == Park || DrvState == Charge || DrvState == FinCharge) && HndState == HandOn)
+  {
+    if (!parkLEDon)
+    {
+      // Turn the Park LED back on 
+      setButtonColor(4,Blue);
+    }
+  }   // End of Handbrake check
+
+  // Check for charger flash timing
+  if (DrvState == Charge && chargeLEDon)
+  {
+    // Calculate the % of the charger light on-time
+    float chargePCTf = chargePCT;
+    chargePCTf = (chargePCTf/100 * (1000 - CHARGING_MIN_FLASH)) + CHARGING_MIN_FLASH;
+    int charge_light_on_time = (int)chargePCTf;
+
+    // Check delay and toggle as necessary
+    if (time_charger_flash_on < (millis() - charge_light_on_time))
+    {
+      #ifdef debug
+      Serial.print("Charge on time : ");
+      Serial.println(charge_light_on_time);
+      #endif
+
+      // Turn the charge light off
+      setButtonColor(1,Black);
+    }
+  }
+  if (DrvState == Charge && !chargeLEDon)
+  {
+    // Calculate the % of the charger light off-time
+    float chargePCTf = chargePCT;
+    chargePCTf = 1000 - CHARGING_MIN_FLASH - (chargePCTf/100 * (1000 - CHARGING_MIN_FLASH)) ;
+    int charge_light_off_time = int(chargePCTf);
+
+    // Check delay and toggle as necessary
+    if (time_charger_flash_off < (millis() - charge_light_off_time))
+    {
+      #ifdef debug
+      Serial.print("Charge off time : ");
+      Serial.println(charge_light_off_time);
+      #endif
+
+      // Turn the charge light off again
+      setButtonColor(1,Red);
+    }
+  } // end of Charge flashing
 
 }
