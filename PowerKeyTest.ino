@@ -14,10 +14,10 @@
  * - When in Park, only allow selection of R or D when FootBreak is pressed 
  *    f1/0 footbrake on/off
  * - Only allow R selection from D, or visa versa, when MPH < 2 mph 
- *         
+ * - Only activate Cruise Adjust (white) the Up and Down buttons when in Drive and MPH > 10         
+ * - Monitor and detect Cruise setting/clearing when up or down held down for 1 full secs 
+ * 
  * TODOs
- * - Only activate Cruise Adjust (white) the Up and Down buttons when in Drive and MPH > 10 
- * - Monitor and detect Cruise setting/clearing (up or down held down for 2 full secs
  * 
  * CHECKS
 */
@@ -41,6 +41,8 @@
 #define ACTIVATED_NIGHTTIME_BRIGHTNESS 0x0F
 #define BACKLIGHT_NIGHTTIME_BRIGHTNESS 0x01
 #define BACKLIGHT_COLOR 0x07    // 01 Red, 02 Green, 03 Blue, 04 Yellow, 05 Cyan, 06 Violet, 07 White, 08 Amber, 09 YelGreen
+#define CRUISE_TIMEHOLD_ACTIVATE 1000   // ms needed to hold up/down buttons to activate cruise control mode
+#define CRUISE_MIN_SPEED 10     // Lowest speed at which cruise mode can be set
 
 // Set up CS on chip
 MCP2515 mcp2515(10);
@@ -129,7 +131,7 @@ uint8_t Colors[8][3] =
 {0,0,0},  // 0 Black - Off
 {0,0,1},  // 1 Blue
 {0,1,0},  // 2 Green
-{0,1,1},  // 3 Cyan ?
+{0,1,1},  // 3 Cyan
 {1,0,0},  // 4 Red
 {1,0,1},  // 5 Magenta
 {1,1,0},  // 6 Amber
@@ -164,6 +166,9 @@ bool dayTimeLights;               // Flag to indicate if daytime or nighttime br
 bool chargeLEDon;           // Flag to indicate if the charging light is on or off
 long time_charger_flash_on;    // Timer since last On status for the charger light
 long time_charger_flash_off;    // Timer since last Off status for the charger light
+bool cruiseActive;            // Flag to indicate if currently in cruise mode
+long time_cruise_activate;    // time since the start of a cruise activate press
+int cruiseMPH;                // cruise speed MPH
 
 void setup() {
 
@@ -179,6 +184,9 @@ void setup() {
   dayTimeLights = true;
   parkLEDon = false;
   chargeLEDon = false;
+  cruiseActive = false;
+  time_cruise_activate = 0;
+  cruiseMPH = 0;
 
   // Populate the pre-op frame
   COstart.can_id = 0x00;
@@ -509,6 +517,40 @@ void loop() {
            Serial.print(ButtonCode[b]);
            Serial.println(" was pressed");
            #endif
+
+           // If Up or Down pressed, start the timer to detect if cruise mode is on or off
+           if (b == 2 || b == 5)
+           {
+             // capture the time of the press 
+             time_cruise_activate = millis();
+             if (cruiseActive)
+             {
+                // Increase or Descrease the cruise speed
+                if (b == 2) // UP
+                {
+                  cruiseMPH = cruiseMPH + 1;
+                  setButtonColor(2,Blue);
+                  delay(100);
+                  setButtonColor(2,Cyan);
+                }
+                if (b == 5)  // DOWN
+                {
+                  cruiseMPH = cruiseMPH - 1;
+                  setButtonColor(5,Blue);
+                  delay(100);
+                  setButtonColor(5,Cyan);
+                }
+                // Checks
+                if (cruiseMPH < 0){cruiseMPH = 0;}
+                if (cruiseMPH > 160){cruiseMPH = 160;}
+                
+                #ifdef debug
+                Serial.print("New Cruise Speed ");
+                Serial.print(cruiseMPH,DEC);
+                Serial.println(" MPH");
+                #endif
+             }
+           }
   
            // Update the drive state, if necessary
             // Scan the State Table
@@ -552,6 +594,12 @@ void loop() {
                   setButtonColor(0,White);
                   DrvState = Reverse;
                 }
+
+                // Check for Changes that drop out of cruise
+                if (cruiseActive && DrvState != Drive)
+                {
+                  cruiseActive = false;
+                }
   
                 #ifdef debug
                 Serial.print("from State : ");
@@ -572,6 +620,52 @@ void loop() {
         }
         if (!butntest && ButtonStates[b])
         {
+          // Test if Up or Down was released
+          if (DrvState == Drive && (b == 2 || b == 5))
+          {
+            // Test if button was held down long enough
+            if (time_cruise_activate!= 0 && (time_cruise_activate < millis() - CRUISE_TIMEHOLD_ACTIVATE))
+            {
+              if (speedMPH >= CRUISE_MIN_SPEED)
+              {
+                // Toggle Cruise mode and capture the current speed as the setting
+                cruiseActive = !cruiseActive;
+                cruiseMPH = speedMPH;
+  
+                // Set button colors to show cruise active
+                if (cruiseActive)
+                {
+                  setButtonColor(2,Cyan);
+                  setButtonColor(5,Cyan);
+                }
+                else
+                {
+                  setButtonColor(2,White);
+                  setButtonColor(5,White);
+                }
+  
+                #ifdef debug
+                Serial.print("Cruise ");
+                Serial.print(cruiseActive?"ON":"OFF");
+                Serial.print(" : Speed ");
+                Serial.println(cruiseMPH, DEC);
+                #endif
+              }
+              else    // speed too low for cruise CRUISE_MIN_SPEED
+              {
+                // Flash red for 1/10 sec
+                setButtonColor(2,Red);
+                setButtonColor(5,Red);
+                delay(100);
+                setButtonColor(2,White);
+                setButtonColor(5,White);
+              }
+            }
+            // Reset the time cruise activate timer - will be restarted on the next Up/Down button press
+            time_cruise_activate = 0;
+
+          }  // end of up/down release
+          
           #ifdef debug
           Serial.print(ButtonCode[b]);
           Serial.println(" was released");
