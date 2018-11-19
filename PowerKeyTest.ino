@@ -9,15 +9,17 @@
  *    h1/0 handbrake on/off
  * - Switch from daytime (bright) to nighttime(dim) brightness settings
  *    d1/0 daytime/nighttime 
- *    
+ * - When the Battery is fully charged, set the charge LED to green 
+ *    mNNN - set the current speed to NNN 
+ * - When in Park, only allow selection of R or D when FootBreak is pressed 
+ *    f1/0 footbrake on/off
+ * - Only allow R selection from D, or visa versa, when MPH < 2 mph 
+ *         
  * TODOs
- * - Only activate Cruise Adjust (white) the Up and Down buttons when in Drive/Reverse and MPH > 0 
- *    mNNN - set the current speed to NNN
- * - Monitor ande detect Cruise setting/clearing (up or down held down for 2 full secs
- * - When the Battery is fully charged, set the charge LED to green
+ * - Only activate Cruise Adjust (white) the Up and Down buttons when in Drive and MPH > 10 
+ * - Monitor and detect Cruise setting/clearing (up or down held down for 2 full secs
  * 
  * CHECKS
- * - Why getting spurious key press signal (v) common on Serial Monitor enable?
 */
 
 #include <mcp2515.h>
@@ -66,8 +68,7 @@ enum PadEvent {
 // Foot Brake States
 enum FootBrake {
   BrakeOn,
-  BrakeOff,
-  BrakeUnk
+  BrakeOff
 };
 
 // Handbrake States
@@ -119,7 +120,7 @@ int ActionTable [BUTTON_ACTIONS][7] = {
 {Reverse,White,Black,Black,Blue,White,Black},
 {Park,White,Black,Black,White,Blue,Black},
 {Charge,Black,Red,Black,Black,Blue,Black},
-{FinCharge,White,Red,Black,White,Blue,Black}
+{FinCharge,Black,Green,Black,Black,Blue,Black}
 };
 
 // Define color table
@@ -285,6 +286,9 @@ void setup() {
   mcp2515.sendMessage(&CObrigt);
   delay(1);
 
+  // Initialize button states
+  for (int b=0;b<6;b++){ButtonStates[b]=false;}
+
   // Reset the keypad display
   setButtonLEDstate(DrvState);
 }
@@ -400,11 +404,25 @@ void loop() {
           else
           {HndState = HandOn;Serial.println("Handbrake ON");}
           break;
-  
+          
+        case 'f':     // 'f' Footbrake
+          if (inNum == 0)
+          {BrkState = BrakeOff;Serial.println("Footbrake OFF");}
+          else
+          {BrkState = BrakeOn;Serial.println("Footbrake ON");}
+          break;
+            
         case 'c':     // 'c' Charge state
           if (inNum < 0){inNum = 0;}
           if (inNum > 100){inNum = 100;}
           chargePCT = inNum;
+          if (chargePCT == 100)
+          {
+            // Set the charge to finished
+            DrvState = FinCharge;
+            // Reset the keypad display
+            setButtonLEDstate(DrvState);
+          }
           Serial.print("Charge ");
           Serial.print(chargePCT,DEC);
           Serial.println("%");
@@ -479,52 +497,88 @@ void loop() {
 
     // Output an intepretation of the frame
     // ID: 0x195 DLC: 5 0x20 0x0 0x0 0x0 0x6 
-    for (int b=0;b<6;b++)
+    if (canMsg.can_id == 0x195)
     {
-      bool butntest = BIT_CHECK(canMsg.data[0],b);
-      if (butntest && !ButtonStates[b])
+      for (int b=0;b<6;b++)
       {
-         // Info on button pressed
-         #ifdef debug
-         Serial.print(ButtonCode[b]);
-         Serial.println(" was pressed");
-         #endif
-
-         // Update the drive state, if necessary
-          // Scan the State Table
-          for (int s=0;s<BUTTON_EVENT_STATES;s++)
-          {
-            // Find the row in the state table where the conditions match
-            if ((StateTable[s][0] == DrvState) && (StateTable[s][1] == ButtonEvent[b]))
+        bool butntest = BIT_CHECK(canMsg.data[0],b);
+        if (butntest && !ButtonStates[b])
+        {
+           // Info on button pressed
+           #ifdef debug
+           Serial.print(ButtonCode[b]);
+           Serial.println(" was pressed");
+           #endif
+  
+           // Update the drive state, if necessary
+            // Scan the State Table
+            for (int s=0;s<BUTTON_EVENT_STATES;s++)
             {
-              // Capture the new DrvState
-              DrvState = (PadState)StateTable[s][2];
+              // Keep prior DrvState
+              PadState PriorState = DrvState;
+              
+              // Find the row in the state table where the conditions match
+              if ((StateTable[s][0] == DrvState) && (StateTable[s][1] == ButtonEvent[b]))
+              {
+                // Capture the new DrvState
+                DrvState = (PadState)StateTable[s][2];
 
-              #ifdef debug
-              Serial.print("from State : ");
-              Serial.print(StateTable[s][0]);
-              Serial.print(" to State : ");
-              Serial.print(DrvState);
-              Serial.print(" Event : ");
-              Serial.println(ButtonEvent[b]);              
-              #endif
+                // Check for full charged, if so put in FinCharge mode
+                if (DrvState == Charge && chargePCT == 100){DrvState = FinCharge;}
 
-              // Update all the lights
-              setButtonLEDstate(DrvState);
+                // if in Park, check that the Footbrake is applied before allowing D or R
+                if (PriorState == Park && (DrvState == Drive || DrvState == Reverse) && BrkState == BrakeOff)
+                {
+                  // Flash the Drive or Reverse button red and then restore to white
+                  if (DrvState == Drive){setButtonColor(0,Red); delay(100); setButtonColor(0,White);}
+                  if (DrvState == Reverse){setButtonColor(3,Red); delay(100); setButtonColor(3,White);}
+                  
+                  // Switch back into Park
+                  DrvState = Park;
+                }
 
-              // be sure to exit the loop
-              s = BUTTON_EVENT_STATES + 1;
+                // if in Drive or Reverse, don't allow selection of the other unless MPH < 2
+                if (PriorState == Drive && DrvState == Reverse && speedMPH > 2)
+                {
+                  setButtonColor(3,Red);
+                  delay(100);
+                  setButtonColor(3,White);
+                  DrvState = Drive;
+                }
+                if (PriorState == Reverse && DrvState == Drive && speedMPH > 2)
+                {
+                  setButtonColor(0,Red);
+                  delay(100);
+                  setButtonColor(0,White);
+                  DrvState = Reverse;
+                }
+  
+                #ifdef debug
+                Serial.print("from State : ");
+                Serial.print(StateTable[s][0]);
+                Serial.print(" to State : ");
+                Serial.print(DrvState);
+                Serial.print(" Event : ");
+                Serial.println(ButtonEvent[b]);              
+                #endif
+  
+                // Update all the lights
+                setButtonLEDstate(DrvState);
+  
+                // be sure to exit the loop
+                s = BUTTON_EVENT_STATES + 1;
+              }
             }
-          }
+        }
+        if (!butntest && ButtonStates[b])
+        {
+          #ifdef debug
+          Serial.print(ButtonCode[b]);
+          Serial.println(" was released");
+          #endif
+        }
+        ButtonStates[b] = butntest;
       }
-      if (!butntest && ButtonStates[b])
-      {
-        #ifdef debug
-        Serial.print(ButtonCode[b]);
-        Serial.println(" was released");
-        #endif
-      }
-      ButtonStates[b] = butntest;
     }
   }     // End of CAN receive checks
 
